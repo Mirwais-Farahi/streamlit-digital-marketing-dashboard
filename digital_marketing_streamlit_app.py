@@ -52,7 +52,8 @@ DEFAULT_ASSET_UID = get_setting("KOBO_ASSET_UID", "")
 VERIFY_SSL = get_setting("KOBO_ENCRYPT_VERIFY_SSL", "true").lower() != "false"
 
 # ---------------------------
-# FIELD MAPPING
+# FIELD MAPPING (use Kobo JSON keys)
+# Tip: if lead_status is inside a group, json_normalize will produce "group/lead_status"
 # ---------------------------
 FIELD = {
     "submitted_at": "_submission_time",
@@ -71,6 +72,58 @@ FIELD = {
 # ---------------------------
 def kobo_headers(token: str):
     return {"Authorization": f"Token {token}"}
+
+def safe_label(x):
+    """Kobo label can be dict (multi-language) or string."""
+    if isinstance(x, dict):
+        # Pick English if exists, else first available
+        return x.get("English") or x.get("en") or next(iter(x.values()), "")
+    return str(x)
+
+def fetch_asset_content(base_url: str, token: str, asset_uid: str, verify_ssl: bool) -> dict:
+    """
+    Fetch Kobo asset definition (survey + choices).
+    """
+    base_url = base_url.rstrip("/")
+    url = f"{base_url}/api/v2/assets/{asset_uid}/"
+    r = requests.get(url, headers=kobo_headers(token), verify=verify_ssl, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def build_select_one_label_map(asset_json: dict) -> dict:
+    """
+    Build: { question_name: { choice_code: choice_label } }
+    from Kobo 'content' -> 'survey' & 'choices'
+    """
+    content = asset_json.get("content", {}) or {}
+    survey = content.get("survey", []) or []
+    choices = content.get("choices", []) or []
+
+    # choices grouped by list_name
+    choices_by_list = {}
+    for ch in choices:
+        list_name = ch.get("list_name")
+        name = ch.get("name")
+        label = safe_label(ch.get("label", name))
+        if list_name and name:
+            choices_by_list.setdefault(list_name, {})[str(name)] = str(label)
+
+    # link question -> list_name
+    q_map = {}
+    for q in survey:
+        q_name = q.get("name")
+        q_type = q.get("type", "")
+        if not q_name or not isinstance(q_type, str):
+            continue
+        # type could be "select_one lead_status_list"
+        if q_type.startswith("select_one "):
+            parts = q_type.split()
+            if len(parts) >= 2:
+                list_name = parts[1].strip()
+                if list_name in choices_by_list:
+                    q_map[str(q_name)] = choices_by_list[list_name]
+
+    return q_map
 
 def kobo_get_data(base_url: str, token: str, asset_uid: str, verify_ssl: bool, limit: int = 30000) -> pd.DataFrame:
     base_url = base_url.rstrip("/")
@@ -93,7 +146,8 @@ def kobo_get_data(base_url: str, token: str, asset_uid: str, verify_ssl: bool, l
         if len(all_rows) >= limit:
             break
 
-    return pd.DataFrame(all_rows)
+    # IMPORTANT: flatten nested/grouped fields
+    return pd.json_normalize(all_rows)
 
 def explode_multiselect(df: pd.DataFrame, col: str) -> pd.DataFrame:
     if col not in df.columns or "_id" not in df.columns:
@@ -127,13 +181,40 @@ def load_kobo_dataframe(base_url: str, token: str, asset_uid: str, verify_ssl: b
 
     return df
 
+@st.cache_data(ttl=300)
+def load_kobo_choice_maps(base_url: str, token: str, asset_uid: str, verify_ssl: bool) -> dict:
+    asset_json = fetch_asset_content(base_url, token, asset_uid, verify_ssl)
+    return build_select_one_label_map(asset_json)
+
+def apply_select_one_labels(df: pd.DataFrame, question_col: str, label_map: dict) -> pd.DataFrame:
+    """
+    Replace codes with labels using Kobo choices.
+    """
+    if question_col not in df.columns:
+        return df
+
+    # Normalize values to string keys for mapping
+    s = df[question_col].copy()
+    s = s.where(s.notna(), None)
+
+    def map_value(v):
+        if v is None:
+            return None
+        key = str(v)
+        return label_map.get(key, key)  # fallback to original if not found
+
+    df[question_col] = s.apply(map_value)
+    return df
+
 # ---------------------------
 # TABLE HELPERS
 # ---------------------------
 def freq_percent_table(series: pd.Series, label_name: str = "Category") -> pd.DataFrame:
     s = series.fillna("Unknown").astype(str)
     counts = s.value_counts(dropna=False)
-    total = counts.sum()
+    total = int(counts.sum()) if counts.sum() else 0
+    if total == 0:
+        return pd.DataFrame({label_name: [], "Frequency": [], "Percent": []})
     return pd.DataFrame({
         label_name: counts.index,
         "Frequency": counts.values,
@@ -141,10 +222,13 @@ def freq_percent_table(series: pd.Series, label_name: str = "Category") -> pd.Da
     })
 
 def show_table(df_table: pd.DataFrame):
+    if df_table.empty:
+        st.info("No data to display.")
+        return
     st.dataframe(df_table.style.format({"Percent": "{:.1f}%"}), use_container_width=True)
 
 # ---------------------------
-# SIDEBAR: INPUT ORDER (BASE URL -> TOKEN -> FORM ID) + DATES
+# SIDEBAR: INPUTS
 # ---------------------------
 KOBO_BASE_URL = st.sidebar.text_input("KOBO_BASE_URL", value=DEFAULT_BASE_URL)
 KOBO_TOKEN = st.sidebar.text_input("KOBO_TOKEN", value=DEFAULT_TOKEN, type="password")
@@ -180,6 +264,29 @@ if submitted_col not in df.columns:
     st.stop()
 
 # ---------------------------
+# Resolve lead_status column if it is inside a group
+# ---------------------------
+status_col = FIELD["lead_status"]
+if status_col not in df.columns:
+    # attempt: find any column that endswith "/lead_status"
+    candidates = [c for c in df.columns if c.endswith("/" + status_col)]
+    if candidates:
+        status_col = candidates[0]  # use first match
+
+# ---------------------------
+# Apply Kobo labels for select_one fields (lead_status)
+# ---------------------------
+try:
+    q_maps = load_kobo_choice_maps(KOBO_BASE_URL, KOBO_TOKEN, KOBO_ASSET_UID, VERIFY_SSL)
+    # q_maps keys are question names (without group). If grouped, we still map values by code.
+    # We apply mapping if question name exists.
+    if FIELD["lead_status"] in q_maps and status_col in df.columns:
+        df = apply_select_one_labels(df, status_col, q_maps[FIELD["lead_status"]])
+except Exception:
+    # If asset content cannot be fetched, continue with raw values
+    pass
+
+# ---------------------------
 # DATE FILTER (DEFAULT: SHOW ALL DATA ON FIRST LOAD)
 # ---------------------------
 valid_dates = df[submitted_col].dropna()
@@ -190,7 +297,6 @@ else:
     min_dt = valid_dates.min().date()
     max_dt = valid_dates.max().date()
 
-# Default to full available range so dashboard loads with ALL submissions
 start_date = st.sidebar.date_input("Start Date", value=min_dt, min_value=min_dt, max_value=max_dt, key="start_date")
 end_date = st.sidebar.date_input("End Date", value=max_dt, min_value=min_dt, max_value=max_dt, key="end_date")
 
@@ -212,13 +318,16 @@ if filtered.empty:
 # ---------------------------
 st.markdown('<div class="section-header">📈 Key Stats (Selected Date Range)</div>', unsafe_allow_html=True)
 
-status_col = FIELD["lead_status"]
 client_type_col = FIELD["client_type"]
 
 total_leads = len(filtered)
 new_clients = int((filtered[client_type_col] == "New Client").sum()) if client_type_col in filtered.columns else 0
 existing_clients = int((filtered[client_type_col] == "Existing Client").sum()) if client_type_col in filtered.columns else 0
-converted = int((filtered[status_col] == "Converted to Client").sum()) if status_col in filtered.columns else 0
+
+converted = 0
+if status_col in filtered.columns:
+    converted = int((filtered[status_col].astype(str).str.lower() == "converted to client").sum())
+
 conversion_rate = (converted / total_leads) if total_leads else 0
 
 c1, c2, c3, c4, c5 = st.columns(5)
@@ -247,26 +356,33 @@ with tab1:
     st.markdown('<div class="section-header">Overview</div>', unsafe_allow_html=True)
     colA, colB = st.columns(2)
 
-    if status_col in filtered.columns:
-        status_order = [
-            "New Lead", "Contacted", "Interested", "Estimate Sent",
-            "Negotiation", "Converted to Client", "Not Interested", "No Response"
-        ]
-        s = filtered[status_col].fillna("Unknown").astype(str)
-        status_counts = s.value_counts().reindex(status_order).fillna(0)
+    # Lead Status (DYNAMIC from Kobo, no manual list)
+    with colA:
+        if status_col in filtered.columns:
+            s = filtered[status_col].fillna("Unknown").astype(str).str.strip()
+            status_counts = s.value_counts()
 
-        with colA:
-            fig_status = px.bar(x=status_counts.index, y=status_counts.values, title="Lead Status Distribution")
-            fig_status.update_xaxes(tickangle=35)
-            st.plotly_chart(fig_status, use_container_width=True)
+            if status_counts.sum() == 0:
+                st.info("Lead status has no values in the selected range.")
+            else:
+                fig_status = px.bar(
+                    x=status_counts.index,
+                    y=status_counts.values,
+                    title="Lead Status Distribution"
+                )
+                fig_status.update_xaxes(tickangle=35)
+                st.plotly_chart(fig_status, use_container_width=True)
 
-            status_tbl = pd.DataFrame({
-                "Lead Status": status_counts.index,
-                "Frequency": status_counts.values.astype(int),
-                "Percent": (status_counts.values / status_counts.values.sum() * 100).round(1)
-            })
-            show_table(status_tbl)
+                status_tbl = pd.DataFrame({
+                    "Lead Status": status_counts.index,
+                    "Frequency": status_counts.values.astype(int),
+                    "Percent": (status_counts.values / status_counts.values.sum() * 100).round(1)
+                })
+                show_table(status_tbl)
+        else:
+            st.warning(f"Lead status column not found. Tried: '{FIELD['lead_status']}' and grouped variants.")
 
+    # Trend
     with colB:
         trend = filtered.groupby(filtered[submitted_col].dt.date).size().reset_index(name="Frequency")
         trend.columns = ["Date", "Frequency"]
@@ -289,7 +405,11 @@ with tab2:
         st.warning(f"Column '{assignee_col}' not found. Update FIELD mapping.")
     else:
         tmp = filtered.copy()
-        tmp["_converted"] = (tmp[status_col] == "Converted to Client") if status_col in tmp.columns else False
+
+        if status_col in tmp.columns:
+            tmp["_converted"] = tmp[status_col].fillna("").astype(str).str.lower().eq("converted to client")
+        else:
+            tmp["_converted"] = False
 
         m = tmp.groupby(assignee_col).agg(
             Frequency=(assignee_col, "size"),
@@ -428,7 +548,7 @@ with tab6:
             )
             show_table(tbl2)
         else:
-            st.warning(f"Column '{status_col}' not found.")
+            st.warning(f"Lead status column not found for pie chart.")
 
 # ---------------------------
 # EXPORT
