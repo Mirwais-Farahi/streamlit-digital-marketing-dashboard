@@ -24,7 +24,7 @@ st.markdown("""
         font-size: 2.2rem;
         font-weight: 800;
         color: #d35400;
-        text-align: center;
+        text-align: left;
         margin-bottom: 1.25rem;
     }
     .section-header {
