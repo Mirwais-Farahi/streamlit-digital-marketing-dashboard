@@ -180,14 +180,19 @@ if submitted_col not in df.columns:
     st.stop()
 
 # ---------------------------
-# DATE FILTER ONLY (START/END)
+# DATE FILTER (DEFAULT: SHOW ALL DATA ON FIRST LOAD)
 # ---------------------------
-today = date.today()
-min_dt = df[submitted_col].dropna().min().date() if df[submitted_col].notna().any() else today
-max_dt = df[submitted_col].dropna().max().date() if df[submitted_col].notna().any() else today
+valid_dates = df[submitted_col].dropna()
+if valid_dates.empty:
+    min_dt = date.today()
+    max_dt = date.today()
+else:
+    min_dt = valid_dates.min().date()
+    max_dt = valid_dates.max().date()
 
-start_date = st.sidebar.date_input("Start Date", value=today, min_value=min_dt, max_value=max_dt)
-end_date = st.sidebar.date_input("End Date", value=today, min_value=min_dt, max_value=max_dt)
+# Default to full available range so dashboard loads with ALL submissions
+start_date = st.sidebar.date_input("Start Date", value=min_dt, min_value=min_dt, max_value=max_dt, key="start_date")
+end_date = st.sidebar.date_input("End Date", value=max_dt, min_value=min_dt, max_value=max_dt, key="end_date")
 
 if start_date > end_date:
     st.sidebar.error("Start Date cannot be after End Date.")
@@ -329,8 +334,10 @@ with tab3:
         colA, colB = st.columns(2)
 
         with colA:
-            st.plotly_chart(px.pie(tbl, names="Inquiry Source", values="Frequency", title="Share of Leads by Source"),
-                            use_container_width=True)
+            st.plotly_chart(
+                px.pie(tbl, names="Inquiry Source", values="Frequency", title="Share of Leads by Source"),
+                use_container_width=True
+            )
             show_table(tbl)
 
         with colB:
@@ -415,8 +422,10 @@ with tab6:
     with colB:
         if status_col in filtered.columns:
             tbl2 = freq_percent_table(filtered[status_col], label_name="Lead Status")
-            st.plotly_chart(px.pie(tbl2, names="Lead Status", values="Frequency", title="Lead Status Share"),
-                            use_container_width=True)
+            st.plotly_chart(
+                px.pie(tbl2, names="Lead Status", values="Frequency", title="Lead Status Share"),
+                use_container_width=True
+            )
             show_table(tbl2)
         else:
             st.warning(f"Column '{status_col}' not found.")
