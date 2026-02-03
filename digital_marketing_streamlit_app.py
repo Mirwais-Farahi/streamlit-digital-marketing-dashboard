@@ -62,7 +62,7 @@ FIELD = {
     "inquiry_type": "inquiry_type",
     "country_residence": "location_country",
     "country_origin": "Country_of_Origin",
-    "next_action": "next_action",
+    "next_action": "contact_tracking/next_action",
     "lead_status": "lead_status",
 }
 
@@ -178,10 +178,6 @@ submitted_col = FIELD["submitted_at"]
 if submitted_col not in df.columns:
     st.error(f"'{submitted_col}' column not found. Update FIELD mapping.")
     st.stop()
-st.sidebar.markdown("### Debug: Columns")
-st.sidebar.write(sorted(df.columns.tolist()))
-st.sidebar.markdown("### Debug: Columns containing 'action'")
-st.sidebar.write([c for c in df.columns if "action" in c.lower() or "next" in c.lower() or "follow" in c.lower()])
 
 # ---------------------------
 # DATE FILTER (DEFAULT: SHOW ALL DATA ON FIRST LOAD)
